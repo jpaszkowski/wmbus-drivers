@@ -37,8 +37,8 @@ private:
     }
     
     // Extract frame (positions 2-17 from payload)
-    size_t start_pos = 2;
-    size_t end_pos = 18;
+    size_t start_pos = 11;
+    size_t end_pos = telegram.size(); 
     
     if (start_pos + 16 <= telegram.size()) {
       frame.assign(telegram.begin() + start_pos, telegram.begin() + std::min(end_pos, telegram.size()));
