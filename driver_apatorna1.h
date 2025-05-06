@@ -1,7 +1,3 @@
-/*
-  Based on: https://github.com/wmbusmeters/wmbusmeters/blob/master/src/driver_apatorna1.cc
-  Copyright (C) 2017-2022 Fredrik Öhrström (gpl-3.0-or-later)
-*/
 #pragma once
 #include "driver.h"
 #include <vector>
@@ -51,10 +47,10 @@ private:
     int multiplier = pow(10, (frame.at(1) & 0b00110000) >> 4);
 
     // Extract the reading from bytes 1-4
-    int reading = static_cast<int>(frame.at(3)) << 20 |
-                  static_cast<int>(frame.at(2)) << 12 |
-                  static_cast<int>(frame.at(1)) << 4  |
-                  (static_cast<int>(frame.at(0)) & 0b00001111);  // Adjusted frame indexing
+    int reading = static_cast<int>(frame.at(0)) << 24 |
+                  static_cast<int>(frame.at(1)) << 16 |
+                  static_cast<int>(frame.at(2)) << 8 |
+                  static_cast<int>(frame.at(3));  // Ensure correct frame positions
 
     // Calculate volume in m3
     double volume = static_cast<double>(reading) * multiplier / 1000;
