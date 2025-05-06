@@ -26,28 +26,10 @@ struct ApatorNa1: Driver
   };
 
 private:
-  // Attempt to decrypt the frame using AES-CBC if key is provided
-  bool decrypt_frame(std::vector<unsigned char> &frame) {
-    if (this->key.empty() || this->key == "00000000000000000000000000000000") {
-      // No key or zero key - no decryption needed
-      return true;
-    }
-    
-    // In the original code, decrypt_TPL_AES_CBC_IV is used
-    // If your Driver class has a decryption method, you should call it here
-    // For now, we'll just log that decryption would be needed
-    ESP_LOGW(TAG, "Frame requires decryption but decrypt_TPL_AES_CBC_IV not implemented in this version");
-    
-    // Return true to continue processing with undecrypted data
-    // Return false if decryption is mandatory and failed
-    return true;
-  }
-
   esphome::optional<double> get_total_water_m3(std::vector<unsigned char> &telegram) {
     esphome::optional<double> ret_val{};
     
     // Extract payload - we need content from position 2 onwards
-    // Create frame similar to the original driver
     std::vector<unsigned char> frame;
     if (telegram.size() < 4) {
       ESP_LOGW(TAG, "Telegram too short for Apator Na1");
@@ -62,15 +44,6 @@ private:
       frame.assign(telegram.begin() + start_pos, telegram.begin() + std::min(end_pos, telegram.size()));
     } else {
       ESP_LOGW(TAG, "Telegram too short to extract frame for Apator Na1");
-      return {};
-    }
-    
-    // In the original code, t->tpl_acc = content[0]
-    // But in our simplified version, we don't have access to this
-    
-    // Try to decrypt the frame if needed
-    if (!decrypt_frame(frame)) {
-      ESP_LOGW(TAG, "Failed to decrypt Apator Na1 frame");
       return {};
     }
     
