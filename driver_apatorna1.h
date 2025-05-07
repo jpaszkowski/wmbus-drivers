@@ -22,14 +22,17 @@ struct ApatorNa1 : public Driver {
 
   /**
    * Extracts available values from a decrypted telegram
-   * @param telegram Vector of bytes containing decrypted telegram data
+   * @param telegram Full decrypted M-Bus frame
    * @return Map of sensor names to values, or empty optional if parsing fails
    */
   virtual esphome::optional<std::map<std::string, double>> get_values(
       std::vector<unsigned char> &telegram) override {
-    std::map<std::string, double> ret;
-    add_to_map(ret, "total_water_m3", this->get_total_water_m3(telegram));
-    if (!ret.empty()) {
+    // Parse total water consumption
+    auto total = this->get_total_water_m3(telegram);
+    if (total.has_value()) {
+      ESP_LOGD(TAG, "ApatorNa1: total_water_m3 = %.3f m³", total.value());
+      std::map<std::string, double> ret;
+      ret["total_water_m3"] = total.value();
       return ret;
     }
     return {};
@@ -37,24 +40,29 @@ struct ApatorNa1 : public Driver {
 
 private:
   /**
-   * Parses the total water consumption (in m³) from the telegram
+   * Parses the total water consumption (in m³) from the full frame
    */
   esphome::optional<double> get_total_water_m3(
       std::vector<unsigned char> &telegram) {
-    // Need at least 5 bytes for exponent and reading
-    if (telegram.size() < 5) {
+    // Ensure we have at least 15 bytes (header + first data)
+    if (telegram.size() < 15) {
       return {};
     }
-    // Exponent is in bits 4-5 of byte 1
-    int exp = (telegram[1] & 0x30) >> 4;
+    // In short TPL frames, data starts after CI (index 10) + tpl-acc (index 11)
+    // So payload begins at index 12
+    size_t idx = 12;
+    if (telegram.size() < idx + 4) {
+      return {};
+    }
+    // Exponent is in bits 4-5 of payload byte 0 (telegram[idx])
+    int exp = (telegram[idx] & 0x30) >> 4;
     int multiplier = static_cast<int>(std::pow(10, exp));
-    // Reading is 4 bytes spanning nibbles
-    uint32_t reading = (static_cast<uint32_t>(telegram[4]) << 20) |
-                       (static_cast<uint32_t>(telegram[3]) << 12) |
-                       (static_cast<uint32_t>(telegram[2]) << 4)  |
-                       (static_cast<uint32_t>(telegram[1]) & 0x0F);
+    // Reading is 4 bytes spanning nibbles: payload[0] low nibble and payload[1..3]
+    uint32_t reading = ((static_cast<uint32_t>(telegram[idx + 3]) << 20) |
+                        (static_cast<uint32_t>(telegram[idx + 2]) << 12) |
+                        (static_cast<uint32_t>(telegram[idx + 1]) << 4)  |
+                        (static_cast<uint32_t>(telegram[idx]) & 0x0F));
     double volume = static_cast<double>(reading) * multiplier / 1000.0;
-    ESP_LOGVV(TAG, "Parsed total_water_m3: reading=%u, multiplier=%d, volume=%f", reading, multiplier, volume);
     return volume;
   }
 };
