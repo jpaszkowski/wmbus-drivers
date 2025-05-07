@@ -1,16 +1,6 @@
-// Definicja funkcji zewnętrznej - zakładamy, że jest dostępna w Twoim środowisku
-extern void decrypt_TPL_AES_CBC_IV(void* t, std::vector<unsigned char>& frame, 
-                              std::vector<unsigned char>::iterator& pos, 
-                              std::vector<unsigned char>& aes_key,
-                              int* num_encrypted_bytes, int* num_not_encrypted_at_end);
-
-// Definicja struktury pomocniczej kompatybilnej z oryginałem
-struct TelegramHelper {
-  unsigned char tpl_acc;
-};
-
 esphome::optional<double> get_total_water_m3(std::vector<unsigned char> &telegram) {
   esphome::optional<double> ret_val{};
+  const char* TAG = "apator_na1"; // Dodane dla logów
   
   // Sprawdzenie długości telegramu
   if (telegram.size() < 4) {
@@ -29,19 +19,31 @@ esphome::optional<double> get_total_water_m3(std::vector<unsigned char> &telegra
     return {};
   }
   
-  // Przygotowanie danych do deszyfrowania
-  TelegramHelper t;
-  t.tpl_acc = telegram[0];
-  
-  std::vector<unsigned char>::iterator pos = frame.begin();
-  std::vector<unsigned char> aes_key(16, 0);  // Klucz AES (same zera)
-  int num_encrypted_bytes = 0;
-  int num_not_encrypted_at_end = 0;
+  // Tworzymy kopię ramki do deszyfrowania
+  std::vector<unsigned char> decrypted_frame(frame.size());
   
   try {
-    // Próba deszyfrowania - jeśli funkcja nie istnieje, zostanie rzucony wyjątek
-    decrypt_TPL_AES_CBC_IV(&t, frame, pos, aes_key, &num_encrypted_bytes, &num_not_encrypted_at_end);
+    // Przygotowanie klucza AES (same zera)
+    std::vector<unsigned char> aes_key(16, 0);
+    
+    // Wektor inicjalizacyjny (IV) - również same zera dla prostoty
+    // Możesz dostosować IV zgodnie z wymaganiami protokołu
+    std::vector<unsigned char> iv(16, 0);
+    
+    // Deszyfrowanie przy użyciu dostępnej funkcji AES_CBC_decrypt_buffer
+    AES_CBC_decrypt_buffer(
+      decrypted_frame.data(),    // output
+      frame.data(),              // input
+      frame.size(),              // length
+      aes_key.data(),            // key
+      iv.data()                  // iv
+    );
+    
     ESP_LOGD(TAG, "Decryption completed successfully");
+    
+    // Po deszyfrowaniu używamy zdekodowanej ramki zamiast oryginalnej
+    frame = decrypted_frame;
+    
   } catch (const std::exception& e) {
     ESP_LOGW(TAG, "Decryption failed: %s", e.what());
     // Kontynuujemy bez deszyfrowania
