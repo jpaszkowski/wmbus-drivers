@@ -10,6 +10,9 @@
 namespace esphome {
 namespace wmbus {
 
+// Forward declaration of the decrypt_TPL_AES_CBC_IV function from utils.h
+bool decrypt_TPL_AES_CBC_IV(std::vector<unsigned char> &frame, std::vector<unsigned char> &aeskey);
+
 /**
  * ApatorNa1 water meter driver
  * Parses decrypted M-Bus telegram to extract total water consumption (m³)
@@ -41,47 +44,6 @@ struct ApatorNa1 : public Driver {
 
 private:
   /**
-   * AES-CBC-IV decryption implementation
-   * Based on wmbusmeters.org implementation
-   */
-  bool decrypt_AES_CBC_IV(const std::vector<unsigned char>& input,
-                          std::vector<unsigned char>& output,
-                          const std::vector<unsigned char>& key,
-                          const std::vector<unsigned char>& telegram) {
-    // We need mbedtls for AES on ESP32
-    if (input.size() < 16) {
-      ESP_LOGW(TAG, "Input too small for decryption");
-      return false;
-    }
-
-    // Create IV using similar logic to wmbusmeters
-    std::vector<unsigned char> iv(16, 0);
-    
-    // First 2 bytes: manufacturer (M-field)
-    iv[0] = telegram[2]; // Manufacturer byte 1
-    iv[1] = telegram[3]; // Manufacturer byte 2
-    
-    // Next 6 bytes: device ID (A-field)
-    for (int i = 0; i < 6; ++i) {
-      iv[i+2] = telegram[4+i]; // Device ID bytes
-    }
-    
-    // Last 8 bytes: payload[0] repeated (ACC)
-    unsigned char acc = telegram[11]; // First byte after CI field
-    for (int i = 0; i < 8; ++i) {
-      iv[i+8] = acc;
-    }
-    
-    // Make sure input size is multiple of 16 (AES block size)
-    size_t num_bytes_to_decrypt = (input.size() / 16) * 16;
-    
-    // Use mbedtls for AES decryption
-    output = this->aes_decrypt(input, key, iv);
-    
-    return !output.empty();
-  }
-
-  /**
    * Parses the total water consumption (in m³) from the full frame
    */
   esphome::optional<double> get_total_water_m3(
@@ -101,49 +63,37 @@ private:
       return {};
     }
     
-    // Extract payload from telegram
-    std::vector<unsigned char> payload;
-    for (size_t i = CI_IDX + 1; i < telegram.size(); i++) {
-      payload.push_back(telegram[i]);
-    }
+    // Create a copy of the telegram that we can modify for decryption
+    std::vector<unsigned char> telegram_copy = telegram;
     
-    // Check if payload is large enough
-    if (payload.size() < 4) {
-      ESP_LOGD(TAG, "ApatorNa1: payload too small");
-      return {};
-    }
+    // Create all-zeros AES key (as used in original wmbusmeters implementation)
+    std::vector<unsigned char> aes_key(16, 0);
     
-    // Create frame from payload bytes 2-18 (like in original implementation)
-    std::vector<unsigned char> frame;
-    for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
-      frame.push_back(payload[i]);
-    }
-    
-    // Decrypt frame using AES-CBC-IV with key "00000000000000000000000000000000"
-    std::vector<unsigned char> aes_key(16, 0);  // All zeros key
-    std::vector<unsigned char> decrypted_frame;
-    
-    bool decryption_success = decrypt_AES_CBC_IV(frame, decrypted_frame, aes_key, telegram);
-    
-    if (!decryption_success) {
+    // Use the built-in decrypt_TPL_AES_CBC_IV function to decrypt the telegram
+    // This modifies the telegram_copy vector in-place
+    if (!decrypt_TPL_AES_CBC_IV(telegram_copy, aes_key)) {
       ESP_LOGD(TAG, "ApatorNa1: decryption failed");
       return {};
     }
     
-    // Calculate water consumption from decrypted frame
-    if (decrypted_frame.size() < 5) {
-      ESP_LOGD(TAG, "ApatorNa1: decrypted frame too short");
+    // After decryption, we need to find the start of the decrypted data
+    // In the original implementation, this starts at offset 15 for CI field 0xA0
+    constexpr size_t DATA_OFFSET = 15;
+    
+    // Check if we have enough data after decryption
+    if (telegram_copy.size() < DATA_OFFSET + 5) {
+      ESP_LOGD(TAG, "ApatorNa1: decrypted telegram too short");
       return {};
     }
     
-    // The multiplier is calculated from bits 4-5 of byte 1 in the frame
-    const int multiplier = std::pow(10, (decrypted_frame[1] & 0b00110000) >> 4);
+    // The multiplier is calculated from bits 4-5 of byte 1 in the decrypted data
+    const int multiplier = std::pow(10, (telegram_copy[DATA_OFFSET + 1] & 0b00110000) >> 4);
     
-    // The reading uses bytes 1-4 of the frame
-    const uint32_t reading = static_cast<uint32_t>(decrypted_frame[4]) << 20 |
-                           static_cast<uint32_t>(decrypted_frame[3]) << 12 |
-                           static_cast<uint32_t>(decrypted_frame[2]) << 4  |
-                           (static_cast<uint32_t>(decrypted_frame[1]) & 0x0F);
+    // The reading uses bytes 1-4 of the decrypted data
+    const uint32_t reading = static_cast<uint32_t>(telegram_copy[DATA_OFFSET + 4]) << 20 |
+                             static_cast<uint32_t>(telegram_copy[DATA_OFFSET + 3]) << 12 |
+                             static_cast<uint32_t>(telegram_copy[DATA_OFFSET + 2]) << 4  |
+                             (static_cast<uint32_t>(telegram_copy[DATA_OFFSET + 1]) & 0x0F);
     
     // Convert to cubic meters
     const double volume = static_cast<double>(reading) * multiplier / 1000.0;
