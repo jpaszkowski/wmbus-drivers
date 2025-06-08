@@ -103,7 +103,8 @@ private:
     }
      // Create frame from payload bytes 2-18 for decryption
     std::vector<unsigned char> frame;
-    for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
+    size_t max_size = (payload.size() < 18) ? payload.size() : 18;
+    for (size_t i = 2; i < max_size; i++) {
       frame.push_back(payload[i]);
     }
     
