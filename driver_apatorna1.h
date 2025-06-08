@@ -57,9 +57,9 @@ private:
       return {};
     }
     
-    // Check if we have manufacturer-specific data (CI field = 0xA0)
-    if (telegram[CI_IDX] != 0xA0) {
-      ESP_LOGD(TAG, "ApatorNa1: CI field 0x%02X is not 0xA0 (manufacturer specific)", telegram[CI_IDX]);
+    // Check if we have manufacturer-specific data (CI field = 0xA0 or 0xA1)
+    if (telegram[CI_IDX] != 0xA0 && telegram[CI_IDX] != 0xA1) {
+      ESP_LOGD(TAG, "ApatorNa1: CI field 0x%02X is not 0xA0/0xA1 (manufacturer specific)", telegram[CI_IDX]);
       return {};
     }
     
