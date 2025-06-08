@@ -36,6 +36,11 @@ struct ApatorNa1 : public Driver {
     ESP_LOGI(TAG, "ApatorNa1: trying get water from telegram");
     auto total = this->get_total_water_m3(telegram);
     if (total.has_value()) {
+      // Check if the value is reasonable (for a water meter)
+      if (total.value() > 1000.0) {
+        ESP_LOGW(TAG, "ApatorNa1: Suspicious water value: %.3f m³ - likely decoding error", total.value());
+        return {}; // Don't return unreasonable values
+      }
       ESP_LOGI(TAG, "ApatorNa1: total_water_m3 = %.3f m³", total.value());
       std::map<std::string, double> ret;
       ret["total_water_m3"] = total.value();
@@ -75,7 +80,8 @@ private:
     }
     
     ESP_LOGI(TAG, "ApatorNa1: CI field is 0x%02X - telegram is valid format", telegram[CI_IDX]);
-     // Extract payload from telegram (everything after CI field)
+
+    // Extract payload from telegram (everything after CI field)
     std::vector<unsigned char> payload;
     for (size_t i = CI_IDX + 1; i < telegram.size(); i++) {
       payload.push_back(telegram[i]);
@@ -95,6 +101,20 @@ private:
       ESP_LOGI(TAG, "ApatorNa1: Payload too small");
       return {};
     }
+     // Create frame from payload bytes 2-18 for decryption
+    std::vector<unsigned char> frame;
+    for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
+      frame.push_back(payload[i]);
+    }
+    
+    // Print frame for debugging
+    std::string frame_hex;
+    for (const auto& byte : frame) {
+      char buf[3];
+      snprintf(buf, sizeof(buf), "%02X", byte);
+      frame_hex += buf;
+    }
+    ESP_LOGI(TAG, "ApatorNa1: Frame before decryption: %s", frame_hex.c_str());
     
     // Create all-zeros AES key (as used in original wmbusmeters implementation)
     std::vector<unsigned char> aes_key(16, 0);
@@ -102,72 +122,92 @@ private:
     // Create a copy of the telegram that we can modify for decryption
     std::vector<unsigned char> telegram_copy = telegram;
     
-    // Create frame from payload bytes 2-18 for decryption
-    int pos = CI_IDX + 3; // Skip CI field and first 2 payload bytes
-    
-    if (pos + 1 >= telegram.size()) {
-      ESP_LOGI(TAG, "ApatorNa1: unexpected record length %d at pos %d", 
-               (int)telegram.size() - pos, pos);
+    // Use the built-in decrypt_TPL_AES_CBC_IV function to decrypt the telegram
+    // This modifies the telegram_copy vector in-place
+    if (!decrypt_TPL_AES_CBC_IV(telegram_copy, aes_key)) {
+      ESP_LOGI(TAG, "ApatorNa1: decryption failed with all-zeros key");
       return {};
     }
     
-    // Get data and check its length (DIF byte contains the data length)
-    unsigned char dif = telegram[pos];
-    int data_len = 0;
-    int exp = 0;
-    
-    // Check if it's a variable length data field
-    if ((dif & 0x0F) == 0x0D) {
-      // Variable length, length is in the next byte
-      data_len = telegram[pos+1];
-      pos += 2; // Skip DIF and length byte
-    } else {
-      // Fixed length, determine from DIF
-      switch (dif & 0x0F) {
-        case 0x01: data_len = 1; break; // 8 bit integer
-        case 0x02: data_len = 2; break; // 16 bit integer
-        case 0x03: data_len = 3; break; // 24 bit integer
-        case 0x04: data_len = 4; break; // 32 bit integer
-        case 0x06: data_len = 6; break; // 48 bit integer
-        case 0x07: data_len = 8; break; // 64 bit integer
-        default:
-          ESP_LOGI(TAG, "ApatorNa1: unsupported DIF 0x%02X", dif);
-          return {};
-      }
-      pos += 1; // Skip DIF
+    // Print the decrypted telegram for debugging
+    std::string decrypted_hex;
+    for (const auto& byte : telegram_copy) {
+      char buf[3];
+      snprintf(buf, sizeof(buf), "%02X", byte);
+      decrypted_hex += buf;
     }
+    ESP_LOGI(TAG, "ApatorNa1: Decrypted telegram: %s", decrypted_hex.c_str());
     
-    // Check for exponent in DIF
-    if (dif & 0x20) {
-      exp = -1; // Divide by 10
-    } else if (dif & 0x40) {
-      exp = 1;  // Multiply by 10
-    }
+    // Skip to the beginning of decrypted data (offset is 0 after decrypt_TPL_AES_CBC_IV)
+    size_t offset = CI_IDX + 1; // Start right after CI field
     
     // Check if we have enough data
-    if (pos + data_len > telegram.size()) {
-      ESP_LOGI(TAG, "ApatorNa1: not enough data (need %d bytes at pos %d)", 
-               data_len, pos);
+    if (telegram_copy.size() < offset + 5) {
+      ESP_LOGI(TAG, "ApatorNa1: decrypted telegram too short");
       return {};
     }
     
-    // Read the value
+    // Now we'll extract data from the decrypted frame
+    // After decrypt_TPL_AES_CBC_IV, we need to check at offset 0
+    // but for safety, let's check if there's a 2F2F pattern anywhere
+    bool found_2f2f = false;
+    size_t data_offset = 0;
+    
+    for (size_t i = 0; i < telegram_copy.size() - 1; i++) {
+      if (telegram_copy[i] == 0x2F && telegram_copy[i+1] == 0x2F) {
+        found_2f2f = true;
+        data_offset = i + 2; // Skip the 2F2F marker
+        ESP_LOGI(TAG, "ApatorNa1: found 2F2F verification pattern at offset %d", i);
+        break;
+      }
+    }
+    
+    // Check if we have enough data after 2F2F (if found)
+    if (found_2f2f && telegram_copy.size() < data_offset + 5) {
+      ESP_LOGI(TAG, "ApatorNa1: decrypted telegram too short after 2F2F marker");
+      return {};
+    }
+    
+    // Try to get data either after 2F2F marker or directly from telegram_copy
+    // based on your original test code
+    double volume = 0.0;
     uint32_t reading = 0;
-    for (int i = 0; i < data_len; i++) {
-      reading |= static_cast<uint32_t>(telegram[pos + i]) << (8 * i);
+    int multiplier = 1;
+    
+    if (found_2f2f) {
+      // The multiplier is calculated from bits 4-5 of byte 1 in the decrypted data
+      multiplier = std::pow(10, (telegram_copy[data_offset + 1] & 0b00110000) >> 4);
+      
+      // The reading uses bytes 1-4 of the decrypted data
+      reading = static_cast<uint32_t>(telegram_copy[data_offset + 4]) << 20 |
+                static_cast<uint32_t>(telegram_copy[data_offset + 3]) << 12 |
+                static_cast<uint32_t>(telegram_copy[data_offset + 2]) << 4  |
+                (static_cast<uint32_t>(telegram_copy[data_offset + 1]) & 0x0F);
+      
+      // Convert to cubic meters
+      volume = static_cast<double>(reading) * multiplier / 1000.0;
+      
+      ESP_LOGI(TAG, "ApatorNa1: DATA_OFFSET=%d, multiplier=%d, reading=%u, volume=%.3f m³",
+              data_offset, multiplier, reading, volume);
+    } else {
+      // If 2F2F pattern wasn't found, try to use the first part of decrypted data
+      // The multiplier is calculated from bits 4-5 of byte 1 in the decrypted data
+      multiplier = std::pow(10, (telegram_copy[offset + 1] & 0b00110000) >> 4);
+      
+      // The reading uses bytes 1-4 of the decrypted data
+      reading = static_cast<uint32_t>(telegram_copy[offset + 4]) << 20 |
+                static_cast<uint32_t>(telegram_copy[offset + 3]) << 12 |
+                static_cast<uint32_t>(telegram_copy[offset + 2]) << 4  |
+                (static_cast<uint32_t>(telegram_copy[offset + 1]) & 0x0F);
+      
+      // Convert to cubic meters
+      volume = static_cast<double>(reading) * multiplier / 1000.0;
+      
+      ESP_LOGI(TAG, "ApatorNa1: DATA_OFFSET=%d, multiplier=%d, reading=%u, volume=%.3f m³",
+              offset, multiplier, reading, volume);
     }
     
-    // Calculate volume in cubic meters
-    double volume = static_cast<double>(reading);
-    if (exp < 0) {
-      volume /= pow(10, -exp);
-    } else if (exp > 0) {
-      volume *= pow(10, exp);
-    }
-    volume /= 1000.0; // Convert from liters to cubic meters
-    
-    ESP_LOGI(TAG, "ApatorNa1 debug: pos=%d, dif=0x%02X, len=%d, exp=%d, reading=%u, volume=%.3f m³",
-             pos, dif, data_len, exp, reading, volume);
+    return volume;
     
     return volume;
     
