@@ -1,7 +1,3 @@
-/*
-  Based on apator_test.cpp implementation for Apator NA-1 water meter
-*/
-
 #pragma once
 
 #include "driver.h"
@@ -171,46 +167,9 @@ private:
     // Initialize output vector
     output.resize(input.size());
 
-#ifdef USE_OPENSSL
-    // Use OpenSSL for standalone testing
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        ESP_LOGV(TAG, "Error creating cipher context");
-        return false;
-    }
-    
-    // Initialize decryption operation
-    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key.data(), iv.data())) {
-        ESP_LOGV(TAG, "Error initializing decryption");
-        EVP_CIPHER_CTX_free(ctx);
-        return false;
-    }
-    
-    // Disable padding
-    EVP_CIPHER_CTX_set_padding(ctx, 0);
-    
-    // Perform decryption
-    int outlen;
-    if (1 != EVP_DecryptUpdate(ctx, output.data(), &outlen, input.data(), num_bytes_to_decrypt)) {
-        ESP_LOGV(TAG, "Error during decryption");
-        EVP_CIPHER_CTX_free(ctx);
-        return false;
-    }
-    
-    // Finalize decryption
-    int tmplen;
-    if (1 != EVP_DecryptFinal_ex(ctx, output.data() + outlen, &tmplen)) {
-        // This might fail due to padding, but we can ignore it since we don't use padding
-        ESP_LOGV(TAG, "Warning: Finalization failed, but continuing anyway");
-    }
-    
-    // Clean up
-    EVP_CIPHER_CTX_free(ctx);
-#else
     // Use ESPHome AES implementation
     esphome::wmbus::AES_CBC_decrypt_buffer(output.data(), const_cast<unsigned char*>(input.data()), 
                                            num_bytes_to_decrypt, key.data(), iv.data());
-#endif
     
     // If there are unencrypted bytes at the end, copy them
     size_t num_not_encrypted_at_end = input.size() - num_bytes_to_decrypt;
