@@ -258,6 +258,15 @@ int main() {
     double volume3 = extract_water_consumption(bytes3);
     std::cout << "Result: " << volume3 << " m³" << std::endl;
     
+    // Example 4: Expected value 19.538 m³
+    std::string telegram4 = "|1c440106797261071407a04f0106792624fBcBd95e21f2f1Ba80B3d7dB|";
+    std::cout << "\n\nEXAMPLE 4: " << telegram4 << std::endl;
+    std::cout << "Expected value: 19.538 m³" << std::endl;
+    auto bytes4 = parse_telegram(telegram4);
+    double volume4 = extract_water_consumption(bytes4);
+    std::cout << "Result: " << volume4 << " m³" << std::endl;
+
+
     // Clean up OpenSSL
     EVP_cleanup();
     ERR_free_strings();

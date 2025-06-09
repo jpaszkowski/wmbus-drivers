@@ -78,7 +78,7 @@ private:
       return false;
     }
 
-    // Create IV using similar logic to original implementation
+    // Create IV following exactly the same approach as in the successful test code
     // 1. First 8 bytes are manufacturer and device ID (A-field and M-field in original)
     // 2. Last 8 bytes are the first byte of payload (ACC in original) repeated
     std::vector<unsigned char> iv(16, 0);
@@ -93,6 +93,7 @@ private:
     }
     
     // Last 8 bytes: payload[0] repeated (ACC)
+    // In the test code, this is the first byte after CI field (index 11)
     unsigned char acc = telegram[11]; // First byte after CI field
     for (int i = 0; i < 8; ++i) {
       iv[i+8] = acc;
@@ -165,22 +166,38 @@ private:
       return {};
     }
 
-    // Create frame from payload bytes 2-18 for decryption
+    // Important: Create frame from payload bytes 2-18 for decryption
+    // This exactly matches the test code approach
     std::vector<unsigned char> frame;
-    size_t max_size = std::min(payload.size(), static_cast<size_t>(18));
-    for (size_t i = 2; i < max_size; i++) {
+    for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
       frame.push_back(payload[i]);
     }
     
+    ESP_LOGD(TAG, "ApatorNa1: Using payload[2:%d] for decryption frame", std::min(payload.size(), static_cast<size_t>(18)));
     print_hex(frame, "ApatorNa1: Frame before decryption");
     
     // Create all-zeros AES key (as used in original wmbusmeters implementation)
     std::vector<unsigned char> aes_key(16, 0);
+    print_hex(aes_key, "ApatorNa1: AES Key (all zeros)");
     
     // Decrypt the frame using our custom function
     std::vector<unsigned char> decrypted_frame;
     if (!decrypt_apator_aes_cbc_iv(frame, decrypted_frame, aes_key, telegram)) {
       ESP_LOGE(TAG, "ApatorNa1: decryption failed with all-zeros key");
+      return {};
+    }
+    
+    // Add a check for all-zeros or all-ones in the decrypted frame, which would indicate a decryption issue
+    bool all_zeros = true;
+    bool all_ones = true;
+    for (size_t i = 0; i < decrypted_frame.size() && (all_zeros || all_ones); i++) {
+      if (decrypted_frame[i] != 0x00) all_zeros = false;
+      if (decrypted_frame[i] != 0xFF) all_ones = false;
+    }
+    
+    if (all_zeros || all_ones) {
+      ESP_LOGW(TAG, "ApatorNa1: Decrypted frame contains all %s - likely decryption issue", 
+              all_zeros ? "zeros" : "ones");
       return {};
     }
     
@@ -192,8 +209,22 @@ private:
       return {};
     }
     
+    // Add additional safeguard checks on the decrypted data
+    // First byte is often a specific value (usually < 0x10)
+    if (decrypted_frame[0] > 0x10) {
+      ESP_LOGW(TAG, "ApatorNa1: Unusual first byte in decrypted data: 0x%02X", decrypted_frame[0]);
+      // We'll still try to decode but with a warning
+    }
+    
     // The multiplier is calculated from bits 4-5 of byte 1 in the frame
-    const int multiplier = std::pow(10, (decrypted_frame[1] & 0b00110000) >> 4);
+    int multiplier_bits = (decrypted_frame[1] & 0b00110000) >> 4;
+    if (multiplier_bits > 3) {
+      ESP_LOGW(TAG, "ApatorNa1: Invalid multiplier bits: %d", multiplier_bits);
+      return {}; // Invalid multiplier, likely bad decryption
+    }
+    
+    const int multiplier = std::pow(10, multiplier_bits);
+    ESP_LOGD(TAG, "ApatorNa1 debug: multiplier_bits=%d, multiplier=%d", multiplier_bits, multiplier);
     
     // The reading uses bytes 1-4 of the frame
     const uint32_t reading = static_cast<uint32_t>(decrypted_frame[4]) << 20 |
@@ -203,6 +234,14 @@ private:
     
     // Convert to cubic meters
     const double volume = static_cast<double>(reading) * multiplier / 1000.0;
+    
+    // Sanity check on the result - water meters typically don't exceed 1000 m³
+    if (volume > 1000.0) {
+      ESP_LOGW(TAG, "ApatorNa1: Suspicious water value: %.3f m³ - likely decoding error", volume);
+      ESP_LOGD(TAG, "ApatorNa1 debug: pos=%d, dif=0x%02X, len=%d, exp=%d, reading=%u, volume=%.3f m³",
+              0, decrypted_frame[0], 4, multiplier_bits, reading, volume);
+      return {};
+    }
     
     ESP_LOGI(TAG, "ApatorNa1: multiplier=%d, reading=%u, volume=%.3f m³",
             multiplier, reading, volume);
