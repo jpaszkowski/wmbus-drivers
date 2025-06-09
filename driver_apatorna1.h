@@ -78,7 +78,7 @@ private:
       return false;
     }
 
-    // Create IV using similar logic to original implementation
+    // Create IV exactly like in test code
     // 1. First 8 bytes are manufacturer and device ID (A-field and M-field in original)
     // 2. Last 8 bytes are the first byte of payload (ACC in original) repeated
     std::vector<unsigned char> iv(16, 0);
@@ -98,10 +98,16 @@ private:
       iv[i+8] = acc;
     }
     
+    ESP_LOGD(TAG, "IV Generation: M-field: %02X%02X, A-field: %02X%02X%02X%02X%02X%02X, ACC: %02X",
+             iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], acc);
     print_hex(iv, "Generated IV");
     
     // Make sure input size is multiple of 16 (AES block size)
     size_t num_bytes_to_decrypt = (input.size() / 16) * 16;
+    int num_not_encrypted_at_end = input.size() - num_bytes_to_decrypt;
+    
+    ESP_LOGD(TAG, "Decrypting %d bytes, %d unencrypted bytes at end", 
+             (int)num_bytes_to_decrypt, num_not_encrypted_at_end);
     
     // Initialize output vector
     output.resize(input.size());
@@ -117,10 +123,10 @@ private:
                            iv.data());
     
     // If there are unencrypted bytes at the end, copy them
-    if (input.size() > num_bytes_to_decrypt) {
+    if (num_not_encrypted_at_end > 0) {
       memcpy(output.data() + num_bytes_to_decrypt, 
              input.data() + num_bytes_to_decrypt, 
-             input.size() - num_bytes_to_decrypt);
+             num_not_encrypted_at_end);
     }
     
     return true;
@@ -158,6 +164,7 @@ private:
     }
     
     print_hex(payload, "ApatorNa1: Payload");
+    ESP_LOGD(TAG, "Payload size: %d bytes", (int)payload.size());
     
     // Check if payload is large enough
     if (payload.size() < 4) {
@@ -165,17 +172,22 @@ private:
       return {};
     }
 
-    // Create frame from payload bytes 2-18 for decryption
+    // Create frame from payload bytes 2-18 (like in original implementation)
     std::vector<unsigned char> frame;
-    size_t max_size = std::min(payload.size(), static_cast<size_t>(18));
-    for (size_t i = 2; i < max_size; i++) {
+    size_t start_idx = 2; // Start from payload[2]
+    size_t end_idx = std::min(payload.size(), static_cast<size_t>(18));
+    
+    for (size_t i = start_idx; i < end_idx; i++) {
       frame.push_back(payload[i]);
     }
     
+    ESP_LOGD(TAG, "Frame for decryption: taking payload[%d:%d], frame size: %d", 
+             (int)start_idx, (int)end_idx, (int)frame.size());
     print_hex(frame, "ApatorNa1: Frame before decryption");
     
     // Create all-zeros AES key (as used in original wmbusmeters implementation)
     std::vector<unsigned char> aes_key(16, 0);
+    print_hex(aes_key, "ApatorNa1: AES Key (all zeros)");
     
     // Decrypt the frame using our custom function
     std::vector<unsigned char> decrypted_frame;
@@ -192,10 +204,25 @@ private:
       return {};
     }
     
-    // The multiplier is calculated from bits 4-5 of byte 1 in the frame
-    const int multiplier = std::pow(10, (decrypted_frame[1] & 0b00110000) >> 4);
+    // Sanity check - check if the frame looks reasonable
+    // First byte is often a control code
+    ESP_LOGD(TAG, "Decrypted data - first bytes: %02X %02X %02X %02X %02X",
+             decrypted_frame[0], decrypted_frame[1], decrypted_frame[2], 
+             decrypted_frame[3], decrypted_frame[4]);
     
-    // The reading uses bytes 1-4 of the frame
+    // The multiplier is calculated from bits 4-5 of byte 1 in the frame
+    int multiplier_bits = (decrypted_frame[1] & 0b00110000) >> 4;
+    
+    // Sanity check on multiplier
+    if (multiplier_bits > 3) {
+      ESP_LOGW(TAG, "ApatorNa1: Suspicious multiplier bits: %d (expected 0-3)", multiplier_bits);
+      // We'll still try to continue with a capped value
+      multiplier_bits = multiplier_bits & 0x03; // Cap to 0-3
+    }
+    
+    const int multiplier = std::pow(10, multiplier_bits);
+    
+    // The reading uses bytes 1-4 of the frame (exactly like in test code)
     const uint32_t reading = static_cast<uint32_t>(decrypted_frame[4]) << 20 |
                              static_cast<uint32_t>(decrypted_frame[3]) << 12 |
                              static_cast<uint32_t>(decrypted_frame[2]) << 4  |
@@ -203,6 +230,30 @@ private:
     
     // Convert to cubic meters
     const double volume = static_cast<double>(reading) * multiplier / 1000.0;
+    
+    // Detailed debug
+    ESP_LOGD(TAG, "ApatorNa1 debug: pos=0, dif=0x%02X, len=4, exp=%d, reading=%u, volume=%.3f m³",
+             decrypted_frame[0], multiplier_bits, reading, volume);
+    
+    // Sanity check - typical water meter readings are below 1000 m³
+    if (volume > 1000.0) {
+      ESP_LOGW(TAG, "ApatorNa1: Suspicious water value: %.3f m³ - likely decoding error", volume);
+      
+      // Try an alternative interpretation - sometimes the bits can be misaligned
+      // For debug purposes only - show an alternative calculation
+      uint32_t alt_reading = static_cast<uint32_t>(decrypted_frame[3]) << 16 |
+                             static_cast<uint32_t>(decrypted_frame[2]) << 8 |
+                             static_cast<uint32_t>(decrypted_frame[1]);
+      double alt_volume = static_cast<double>(alt_reading) * multiplier / 1000.0;
+      ESP_LOGD(TAG, "Alternative calculation: reading=%u, volume=%.3f m³", alt_reading, alt_volume);
+      
+      if (alt_volume < 1000.0) {
+        ESP_LOGI(TAG, "Alternative calculation gives more reasonable result: %.3f m³", alt_volume);
+        // But we still return the original calculation for consistency
+      }
+      
+      return {}; // Don't return suspicious values
+    }
     
     ESP_LOGI(TAG, "ApatorNa1: multiplier=%d, reading=%u, volume=%.3f m³",
             multiplier, reading, volume);
