@@ -70,7 +70,9 @@ private:
   bool decrypt_apator_aes_cbc_iv(const std::vector<unsigned char>& input,
                                 std::vector<unsigned char>& output,
                                 const std::vector<unsigned char>& key,
-                                const std::vector<unsigned char>& telegram)
+                                const std::vector<unsigned char>& telegram,
+                                int* num_encrypted_bytes,
+                                int* num_not_encrypted_at_end)
   {
     // Check if we have enough data to decrypt
     if (input.size() < 16) {
@@ -104,10 +106,11 @@ private:
     
     // Make sure input size is multiple of 16 (AES block size)
     size_t num_bytes_to_decrypt = (input.size() / 16) * 16;
-    int num_not_encrypted_at_end = input.size() - num_bytes_to_decrypt;
+    *num_encrypted_bytes = num_bytes_to_decrypt;
+    *num_not_encrypted_at_end = input.size() - num_bytes_to_decrypt;
     
     ESP_LOGD(TAG, "Decrypting %d bytes, %d unencrypted bytes at end", 
-             (int)num_bytes_to_decrypt, num_not_encrypted_at_end);
+             (int)num_bytes_to_decrypt, *num_not_encrypted_at_end);
     
     // Initialize output vector
     output.resize(input.size());
@@ -123,10 +126,10 @@ private:
                            iv.data());
     
     // If there are unencrypted bytes at the end, copy them
-    if (num_not_encrypted_at_end > 0) {
+    if (*num_not_encrypted_at_end > 0) {
       memcpy(output.data() + num_bytes_to_decrypt, 
              input.data() + num_bytes_to_decrypt, 
-             num_not_encrypted_at_end);
+             *num_not_encrypted_at_end);
     }
     
     return true;
@@ -191,7 +194,11 @@ private:
     
     // Decrypt the frame using our custom function
     std::vector<unsigned char> decrypted_frame;
-    if (!decrypt_apator_aes_cbc_iv(frame, decrypted_frame, aes_key, telegram)) {
+    int num_encrypted_bytes = 0;
+    int num_not_encrypted_at_end = 0;
+    
+    if (!decrypt_apator_aes_cbc_iv(frame, decrypted_frame, aes_key, telegram, 
+                                  &num_encrypted_bytes, &num_not_encrypted_at_end)) {
       ESP_LOGE(TAG, "ApatorNa1: decryption failed with all-zeros key");
       return {};
     }
@@ -210,49 +217,55 @@ private:
              decrypted_frame[0], decrypted_frame[1], decrypted_frame[2], 
              decrypted_frame[3], decrypted_frame[4]);
     
-    // The multiplier is calculated from bits 4-5 of byte 1 in the frame
+    // The multiplier is calculated from bits 4-5 of byte 1 in the frame - exactly like in test code
     int multiplier_bits = (decrypted_frame[1] & 0b00110000) >> 4;
     
     // Sanity check on multiplier
     if (multiplier_bits > 3) {
-      ESP_LOGW(TAG, "ApatorNa1: Suspicious multiplier bits: %d (expected 0-3)", multiplier_bits);
-      // We'll still try to continue with a capped value
-      multiplier_bits = multiplier_bits & 0x03; // Cap to 0-3
+      ESP_LOGW(TAG, "ApatorNa1: Invalid multiplier bits: %d (expected 0-3), capping to 0", multiplier_bits);
+      multiplier_bits = 0; // Cap to 0 if invalid
     }
     
     const int multiplier = std::pow(10, multiplier_bits);
     
     // The reading uses bytes 1-4 of the frame (exactly like in test code)
+    // From apator_test.cpp:
+    // const uint32_t reading = static_cast<uint32_t>(decrypted_frame[4]) << 20 |
+    //                        static_cast<uint32_t>(decrypted_frame[3]) << 12 |
+    //                        static_cast<uint32_t>(decrypted_frame[2]) << 4  |
+    //                        (static_cast<uint32_t>(decrypted_frame[1]) & 0x0F);
     const uint32_t reading = static_cast<uint32_t>(decrypted_frame[4]) << 20 |
                              static_cast<uint32_t>(decrypted_frame[3]) << 12 |
                              static_cast<uint32_t>(decrypted_frame[2]) << 4  |
                              (static_cast<uint32_t>(decrypted_frame[1]) & 0x0F);
     
-    // Convert to cubic meters
+    // Convert to cubic meters (exactly as in test code)
     const double volume = static_cast<double>(reading) * multiplier / 1000.0;
     
-    // Detailed debug
+    // Detailed debug - similar to the test code output
     ESP_LOGD(TAG, "ApatorNa1 debug: pos=0, dif=0x%02X, len=4, exp=%d, reading=%u, volume=%.3f m³",
              decrypted_frame[0], multiplier_bits, reading, volume);
     
-    // Sanity check - typical water meter readings are below 1000 m³
+    // Sanity check - water meter readings should be reasonable
     if (volume > 1000.0) {
       ESP_LOGW(TAG, "ApatorNa1: Suspicious water value: %.3f m³ - likely decoding error", volume);
       
-      // Try an alternative interpretation - sometimes the bits can be misaligned
-      // For debug purposes only - show an alternative calculation
-      uint32_t alt_reading = static_cast<uint32_t>(decrypted_frame[3]) << 16 |
-                             static_cast<uint32_t>(decrypted_frame[2]) << 8 |
-                             static_cast<uint32_t>(decrypted_frame[1]);
-      double alt_volume = static_cast<double>(alt_reading) * multiplier / 1000.0;
-      ESP_LOGD(TAG, "Alternative calculation: reading=%u, volume=%.3f m³", alt_reading, alt_volume);
+      // Try using a simpler calculation to see if we get more reasonable values
+      uint32_t simple_reading = 0;
+      for (size_t i = 1; i <= 4 && i < decrypted_frame.size(); i++) {
+        simple_reading = (simple_reading << 8) | decrypted_frame[i];
+      }
+      double simple_volume = static_cast<double>(simple_reading) / 1000.0;
+      ESP_LOGI(TAG, "Alternative simple calculation: reading=%u, volume=%.3f m³", 
+               simple_reading, simple_volume);
       
-      if (alt_volume < 1000.0) {
-        ESP_LOGI(TAG, "Alternative calculation gives more reasonable result: %.3f m³", alt_volume);
-        // But we still return the original calculation for consistency
+      // We'll use the simple value if it's reasonable, otherwise don't return anything
+      if (simple_volume <= 1000.0) {
+        ESP_LOGI(TAG, "Using alternative calculation result");
+        return simple_volume;
       }
       
-      return {}; // Don't return suspicious values
+      return {}; // Don't return unreasonable values
     }
     
     ESP_LOGI(TAG, "ApatorNa1: multiplier=%d, reading=%u, volume=%.3f m³",
