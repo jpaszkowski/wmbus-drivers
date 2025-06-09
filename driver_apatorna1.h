@@ -6,19 +6,6 @@
 
 #include "driver.h"
 
-// For standalone testing without ESPHome
-#ifndef ESP_LOGV
-#define ESP_LOGV(tag, format, ...) printf(format "\n", ##__VA_ARGS__)
-#define ESP_LOGVV(tag, format, ...) printf(format "\n", ##__VA_ARGS__)
-#endif
-
-// For standalone testing, include OpenSSL
-#ifdef USE_OPENSSL
-#include <openssl/evp.h>
-#include <openssl/err.h>
-#include <openssl/aes.h>
-#endif
-
 #include "esphome/components/wmbus/aes.h"
 
 #include <vector>
@@ -32,7 +19,7 @@ struct ApatorNa1: Driver
   
   virtual esphome::optional<std::map<std::string, double>> get_values(std::vector<unsigned char> &telegram) override {
     std::map<std::string, double> ret_val{};
-
+    ESP_LOGV(TAG, "starting get_values for Apator NA-1 with telegram size %zu", telegram.size());
     add_to_map(ret_val, "total_water_m3", this->get_total_water_m3(telegram));
 
     if (ret_val.size() > 0) {
