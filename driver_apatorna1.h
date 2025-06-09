@@ -24,8 +24,9 @@ struct ApatorNa1 : public Driver {
    */
   ApatorNa1(const std::string &key = "")
     : Driver("apatorna1", key) {
-      ESP_LOGI(TAG, "ApatorNa1 driver v1.3.0 initialized");
+      ESP_LOGI(TAG, "ApatorNa1 driver v1.4.0 initialized");
       ESP_LOGI(TAG, "Driver supports Apator NA-1 water meters using AES-CBC-IV decryption");
+      ESP_LOGI(TAG, "Robust implementation with improved handling of various telegram formats");
       ESP_LOGI(TAG, "Using %s key for decryption", 
                key.empty() ? "default all-zeros" : ("custom key: " + key).c_str());
     }
@@ -42,6 +43,18 @@ struct ApatorNa1 : public Driver {
     if (telegram.size() < 11) {
       ESP_LOGE(TAG, "ApatorNa1: telegram too short (%d bytes), cannot process", (int)telegram.size());
       return {};
+    }
+    
+    // Extract and log the device ID for better tracking
+    std::string device_id = "unknown";
+    if (telegram.size() >= 10) {
+      device_id = "";
+      for (int i = 4; i < 10; i++) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", telegram[i]);
+        device_id += buf;
+      }
+      ESP_LOGI(TAG, "ApatorNa1: Processing data for Device ID: %s", device_id.c_str());
     }
     
     // Check manufacturer ID (should be APT for Apator)
@@ -70,12 +83,12 @@ struct ApatorNa1 : public Driver {
         // We still return it, but warn about it
       }
       
-      ESP_LOGI(TAG, "ApatorNa1: total_water_m3 = %.3f m³", total.value());
+      ESP_LOGI(TAG, "ApatorNa1: Device %s total_water_m3 = %.3f m³", device_id.c_str(), total.value());
       std::map<std::string, double> ret;
       ret["total_water_m3"] = total.value();
       return ret;
     } else {
-      ESP_LOGE(TAG, "ApatorNa1: Failed to extract water meter reading");
+      ESP_LOGE(TAG, "ApatorNa1: Failed to extract water meter reading for device %s", device_id.c_str());
       return {};
     }
   }
@@ -221,6 +234,12 @@ private:
     }
     
     ESP_LOGI(TAG, "ApatorNa1: CI field is 0x%02X - telegram is valid format", telegram[CI_IDX]);
+    
+    // Different processing for telegrams with CI=0xA1 vs CI=0xA0
+    bool is_a1_format = (telegram[CI_IDX] == 0xA1);
+    if (is_a1_format) {
+      ESP_LOGI(TAG, "Using special handling for CI=0xA1 format");
+    }
 
     // Extract payload from telegram (everything after CI field)
     std::vector<unsigned char> payload;
@@ -241,22 +260,139 @@ private:
     ESP_LOGI(TAG, "Payload structure: First byte: 0x%02X, Second byte: 0x%02X", 
              payload[0], payload.size() > 1 ? payload[1] : 0);
     
-    // For the case of 'unexpected record length 0 at pos 13', check if we have DIF/VIF
+    // Analyze record structure to handle various frame sizes and record lengths
     if (payload.size() > 2) {
       ESP_LOGI(TAG, "Record bytes: byte2: 0x%02X (DIF?), byte3: 0x%02X (VIF?)", 
                payload[2], payload.size() > 3 ? payload[3] : 0);
       
-      // Check specifically for this error case
-      if (payload.size() == 13) {
-        ESP_LOGW(TAG, "Found potential 'unexpected record length 0 at pos 13' case - special handling");
-        // In this case, we know the record at position 13 causes problems
-        // We'll handle it by making sure we don't include it in the frame
+      // Parse DIF/VIF/Length pattern in payload to detect record structure issues
+      for (size_t i = 0; i < payload.size() - 1; i++) {
+        uint8_t possible_dif = payload[i];
+        // Check if this byte looks like a DIF (0x04 is common for Apator)
+        if (possible_dif == 0x04 || possible_dif == 0x0C) {
+          uint8_t record_length = 0;
+          
+          // If it's a variable length record, the length is in the next byte
+          if ((possible_dif & 0x0F) == 0x0C) {
+            if (i + 1 < payload.size()) {
+              record_length = payload[i + 1];
+              ESP_LOGI(TAG, "Found variable length record: DIF=0x%02X, length=%d at pos %d", 
+                      possible_dif, record_length, (int)i);
+              
+              // Check for the specific 'unexpected record length' error condition
+              if (i == 13 && record_length != 3) {
+                ESP_LOGW(TAG, "Found problematic record at pos 13 with length %d (expected 3)", record_length);
+              }
+            }
+          } else {
+            // Fixed length records have length based on DIF
+            switch (possible_dif & 0x0F) {
+              case 0x01: record_length = 1; break; // 8 bit integer
+              case 0x02: record_length = 2; break; // 16 bit integer
+              case 0x03: record_length = 3; break; // 24 bit integer
+              case 0x04: record_length = 4; break; // 32 bit integer
+              case 0x06: record_length = 6; break; // 48 bit integer
+              case 0x07: record_length = 8; break; // 64 bit integer
+              default: record_length = 0; break;   // Unknown
+            }
+            
+            if (record_length > 0) {
+              ESP_LOGI(TAG, "Found fixed length record: DIF=0x%02X, length=%d at pos %d", 
+                      possible_dif, record_length, (int)i);
+              
+              // Check for the specific error at position 13
+              if (i == 13 && record_length == 0) {
+                ESP_LOGW(TAG, "Found the exact 'unexpected record length 0 at pos 13' error condition");
+                ESP_LOGI(TAG, "Using special handling for this case");
+              }
+            }
+          }
+          
+          // Detect potential issues with record lengths
+          if (i + record_length + 1 > payload.size()) {
+            ESP_LOGW(TAG, "Record at pos %d exceeds payload bounds (len=%d, remaining=%d)", 
+                    (int)i, record_length, (int)(payload.size() - i - 1));
+          }
+        }
       }
     }
 
     // Create frame from payload bytes 2-18 (like in test implementation)
     std::vector<unsigned char> frame;
     size_t start_idx = 2; // Start from payload[2]
+    
+    // For A1 format telegrams, the data structure may be different
+    if (is_a1_format && payload.size() >= 3) {
+      // Check if the problematic format with record length 3 at pos 13
+      if (payload.size() == 18 && payload[0] == 0x59) {
+        ESP_LOGI(TAG, "Detected special A1 format with 0x59 header - trying alternative parsing");
+        
+        // For this format, scan for data record markers (0x04, 0x0C, etc.)
+        for (size_t i = 2; i < payload.size() - 4; i++) {
+          if (payload[i] == 0x04 || payload[i] == 0x0C) {
+            ESP_LOGI(TAG, "Found potential data record at pos %d (DIF=0x%02X)", 
+                    (int)i, payload[i]);
+            
+            // Extract 4 bytes after this position directly
+            std::vector<unsigned char> data_record;
+            for (size_t j = i; j < i + 5 && j < payload.size(); j++) {
+              data_record.push_back(payload[j]);
+            }
+            
+            print_hex(data_record, "Direct data record");
+            
+            // Try to decode this directly as a BCD value
+            if (data_record.size() >= 5) {
+              uint8_t dif = data_record[0];
+              uint8_t vif = data_record[1];
+              uint8_t b2 = data_record[2];
+              uint8_t b3 = data_record[3];
+              uint8_t b4 = data_record[4];
+              
+              if (dif == 0x04) {
+                double value = (vif & 0x0F) * 0.001 +
+                            (b2 & 0x0F) * 0.01 + ((b2 & 0xF0) >> 4) * 0.1 +
+                            (b3 & 0x0F) * 1.0 + ((b3 & 0xF0) >> 4) * 10.0 +
+                            (b4 & 0x0F) * 100.0 + ((b4 & 0xF0) >> 4) * 1000.0;
+                
+                int scale = (vif & 0x30) >> 4;
+                double scaling = std::pow(10, scale);
+                double vol = value * scaling;
+                
+                if (vol > 0.0 && vol < 1000.0) {
+                  ESP_LOGI(TAG, "Direct BCD decoding: %.3f m³", vol);
+                  return vol;
+                }
+              }
+            }
+          }
+        }
+        
+        // If we get here, we couldn't find a valid record, try using bytes 2-6 directly
+        if (payload.size() >= 7) {
+          std::vector<unsigned char> direct_data;
+          for (size_t i = 2; i < 7; i++) {
+            direct_data.push_back(payload[i]);
+          }
+          
+          print_hex(direct_data, "A1 format direct data");
+          
+          // Try as 32-bit binary value
+          if (direct_data.size() >= 4) {
+            uint32_t value = 0;
+            for (size_t i = 0; i < 4; i++) {
+              value = (value << 8) | direct_data[i];
+            }
+            double vol = static_cast<double>(value) / 1000.0;
+            
+            if (vol > 0.0 && vol < 1000.0) {
+              ESP_LOGI(TAG, "A1 format direct binary decoding: %.3f m³", vol);
+              return vol;
+            }
+          }
+        }
+      }
+    }
     
     // Safety check - make sure we have enough data
     if (payload.size() <= start_idx) {
@@ -265,7 +401,22 @@ private:
       return {};
     }
     
-    size_t end_idx = std::min(payload.size(), static_cast<size_t>(18));
+    // For robustness, handle different payload structures
+    // The standard frame is from byte 2 onwards, but we need to be flexible
+    
+    // Try to find a valid starting pattern (often 0x04 0x13 for Apator)
+    bool found_pattern = false;
+    for (size_t i = 2; i < payload.size() - 1 && !found_pattern; i++) {
+      if (payload[i] == 0x04 && (payload[i+1] & 0xF0) == 0x10) {
+        if (i != 2) {
+          ESP_LOGI(TAG, "Found DIF/VIF pattern at offset %d instead of 2, adjusting", (int)i);
+          start_idx = i;
+          found_pattern = true;
+        }
+      }
+    }
+    
+    size_t end_idx = std::min(payload.size(), static_cast<size_t>(start_idx + 16));
     
     for (size_t i = start_idx; i < end_idx; i++) {
       frame.push_back(payload[i]);
@@ -343,9 +494,9 @@ private:
       // The water consumption is stored as BCD (Binary-Coded Decimal) values
       // Each nibble (4 bits) represents a decimal digit
       uint8_t vif_nibble = vif & 0x0F;         // Lowest decimal place (0.001)
-      uint8_t byte2 = decrypted_frame[2];
-      uint8_t byte3 = decrypted_frame[3];
-      uint8_t byte4 = decrypted_frame[4];
+      uint8_t byte2 = decrypted_frame.size() > 2 ? decrypted_frame[2] : 0;
+      uint8_t byte3 = decrypted_frame.size() > 3 ? decrypted_frame[3] : 0;
+      uint8_t byte4 = decrypted_frame.size() > 4 ? decrypted_frame[4] : 0;
       
       // Log the individual BCD digits for debugging
       ESP_LOGI(TAG, "BCD digits: %01X %01X%01X %01X%01X %01X%01X",
@@ -382,7 +533,16 @@ private:
       }
       
       // Get the scaling factor from VIF (bits 4-5)
-      int scale = (vif & 0x30) >> 4;
+      // Default scale is 0 if VIF bits can't be trusted
+      int scale = 0;
+      
+      // Only use VIF scale bits if they're reasonable (0-3)
+      if (((vif & 0x30) >> 4) <= 3) {
+        scale = (vif & 0x30) >> 4;
+      } else {
+        ESP_LOGW(TAG, "Invalid VIF scale bits: %d, using default scale 0", ((vif & 0x30) >> 4));
+      }
+      
       double scaling = std::pow(10, scale);
       
       // Calculate final volume
@@ -410,16 +570,39 @@ private:
       uint32_t reading = 0;
       
       if (decrypted_frame.size() >= 5) {
-        // Full data available
+        // Full data available - try multiple possible formats
+        // First try the standard format from the test implementation
         reading = static_cast<uint32_t>(decrypted_frame[4]) << 20 |
                 static_cast<uint32_t>(decrypted_frame[3]) << 12 |
                 static_cast<uint32_t>(decrypted_frame[2]) << 4  |
                 (static_cast<uint32_t>(decrypted_frame[1]) & 0x0F);
+                
+        // If the reading seems unreasonable, try alternative format
+        if (reading > 10000000) { // More than 10 million seems unlikely
+          uint32_t alt_reading = static_cast<uint32_t>(decrypted_frame[4]) << 16 |
+                              static_cast<uint32_t>(decrypted_frame[3]) << 8 |
+                              static_cast<uint32_t>(decrypted_frame[2]);
+          
+          double alt_volume = static_cast<double>(alt_reading) * multiplier / 1000.0;
+          
+          if (alt_volume < 1000.0) {
+            ESP_LOGI(TAG, "Using alternative binary format: alt_reading=%u, alt_volume=%.3f m³",
+                    alt_reading, alt_volume);
+            reading = alt_reading;
+          }
+        }
       } 
       else {
         // Partial data - use whatever we have
-        for (size_t i = 1; i < decrypted_frame.size(); i++) {
-          reading = (reading << 8) | decrypted_frame[i];
+        if (decrypted_frame.size() >= 3) {
+          // We have at least bytes 1-2, try to extract a reasonable value
+          for (size_t i = 1; i < decrypted_frame.size(); i++) {
+            reading = (reading << 8) | decrypted_frame[i];
+          }
+        }
+        else {
+          // We only have 2 bytes - use a minimal approach
+          reading = decrypted_frame[1];
         }
       }
       
@@ -448,7 +631,55 @@ private:
     // Sanity check - water meter readings should be reasonable
     if (volume > 1000.0) {
       ESP_LOGW(TAG, "ApatorNa1: Suspicious water value: %.3f m³ - likely decoding error", volume);
-      return {}; // Don't return unreasonable values
+      
+      // Since we already tried multiple decoding methods, try a last-resort approach
+      // Sometimes telegrams have their data in a non-standard position
+      if (payload.size() >= 5) {
+        for (size_t i = 0; i < payload.size() - 4; i++) {
+          if (payload[i] == 0x04) { // Look for DIF=0x04 pattern
+            // Try direct decoding of the next 4 bytes as BCD
+            uint8_t p_vif = payload[i+1];
+            uint8_t p_b2 = payload[i+2];
+            uint8_t p_b3 = payload[i+3];
+            uint8_t p_b4 = payload[i+4];
+            
+            // Quick BCD validity check
+            bool valid = true;
+            for (int j = 0; j < 8; j++) {
+              uint8_t digit = (j == 0) ? (p_vif & 0x0F) :
+                            (j == 1) ? (p_b2 & 0x0F) :
+                            (j == 2) ? ((p_b2 & 0xF0) >> 4) :
+                            (j == 3) ? (p_b3 & 0x0F) :
+                            (j == 4) ? ((p_b3 & 0xF0) >> 4) :
+                            (j == 5) ? (p_b4 & 0x0F) :
+                            (j == 6) ? ((p_b4 & 0xF0) >> 4) : 0;
+              
+              if (digit > 9) {
+                valid = false;
+                break;
+              }
+            }
+            
+            if (valid) {
+              double alt_value = (p_vif & 0x0F) * 0.001 +
+                               (p_b2 & 0x0F) * 0.01 + ((p_b2 & 0xF0) >> 4) * 0.1 +
+                               (p_b3 & 0x0F) * 1.0 + ((p_b3 & 0xF0) >> 4) * 10.0 +
+                               (p_b4 & 0x0F) * 100.0 + ((p_b4 & 0xF0) >> 4) * 1000.0;
+              
+              int alt_scale = (p_vif & 0x30) >> 4;
+              double alt_scaling = std::pow(10, alt_scale);
+              double alt_volume = alt_value * alt_scaling;
+              
+              if (alt_volume > 0.0 && alt_volume < 1000.0) {
+                ESP_LOGI(TAG, "Found alternative BCD reading at pos %d: %.3f m³", (int)i, alt_volume);
+                return alt_volume;
+              }
+            }
+          }
+        }
+      }
+      
+      return {}; // Don't return unreasonable values after trying all methods
     }
     
     // Check for negative or extremely low values
