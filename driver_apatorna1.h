@@ -56,9 +56,9 @@ private:
       return {};
     }
     
-    // Check if we have manufacturer-specific data (CI field = 0xA0)
-    if (telegram[CI_IDX] != 0xA0) {
-      ESP_LOGV(TAG, "CI field 0x%02x is not 0xA0 (manufacturer specific)", telegram[CI_IDX]);
+    // Check if we have manufacturer-specific data (CI field = 0xA0 or 0xA1)
+    if (telegram[CI_IDX] != 0xA0 && telegram[CI_IDX] != 0xA1) {
+      ESP_LOGV(TAG, "CI field 0x%02x is not 0xA0/0xA1 (manufacturer specific)", telegram[CI_IDX]);
       return {};
     }
     
@@ -69,6 +69,15 @@ private:
     }
     
     ESP_LOGVV(TAG, "Extracted payload (size %d)", payload.size());
+    ESP_LOGD(TAG, "Payload hex: ");
+    for (size_t i = 0; i < payload.size(); ++i) {
+      ESP_LOGD(TAG, "[%02zu]: 0x%02X", i, payload[i]);
+    }
+    
+    // For A1 telegrams, check the structure
+    if (telegram[CI_IDX] == 0xA1) {
+      ESP_LOGD(TAG, "A1 format detected - treating payload differently");
+    }
     
     // Check if payload is large enough
     if (payload.size() < 4) {
@@ -78,8 +87,25 @@ private:
     
     // Create frame from payload bytes 2-18 (like in original implementation)
     std::vector<unsigned char> frame;
-    for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
-      frame.push_back(payload[i]);
+    
+    // Handling depends on the CI field format
+    if (telegram[CI_IDX] == 0xA0) {
+      // Standard format from original implementation
+      for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
+        frame.push_back(payload[i]);
+      }
+    } else if (telegram[CI_IDX] == 0xA1) {
+      // A1 format - dla telegramów A1 przesunięcie wynosi 2 bajty
+      // Dane zaczynają się od trzeciego bajtu po CI
+      if (payload.size() >= 3) {  // Upewnij się, że mamy co najmniej 3 bajty w payloadzie
+        for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
+          frame.push_back(payload[i]);
+        }
+        ESP_LOGD(TAG, "Extracted A1 format frame, starting from third byte of payload");
+      } else {
+        ESP_LOGD(TAG, "A1 payload too small");
+        return {};
+      }
     }
     
     ESP_LOGVV(TAG, "Extracted frame before decryption, size: %d", frame.size());
