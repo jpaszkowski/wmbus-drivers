@@ -15,7 +15,7 @@ struct ApatorNa1: Driver
   
   virtual esphome::optional<std::map<std::string, double>> get_values(std::vector<unsigned char> &telegram) override {
     std::map<std::string, double> ret_val{};
-    ESP_LOGV(TAG, "starting get_values for Apator NA-1 with telegram size %zu", telegram.size());
+
     add_to_map(ret_val, "total_water_m3", this->get_total_water_m3(telegram));
 
     if (ret_val.size() > 0) {
@@ -52,14 +52,9 @@ private:
     }
     
     ESP_LOGVV(TAG, "Extracted payload (size %d)", payload.size());
-    ESP_LOGD(TAG, "Payload hex: ");
+    ESP_LOGVV(TAG, "Payload hex: ");
     for (size_t i = 0; i < payload.size(); ++i) {
-      ESP_LOGD(TAG, "[%02zu]: 0x%02X", i, payload[i]);
-    }
-    
-    // For A1 telegrams, check the structure
-    if (telegram[CI_IDX] == 0xA1) {
-      ESP_LOGD(TAG, "A1 format detected - treating payload differently");
+      ESP_LOGVV(TAG, "[%02zu]: 0x%02X", i, payload[i]);
     }
     
     // Check if payload is large enough
@@ -84,7 +79,7 @@ private:
         for (size_t i = 2; i < std::min(payload.size(), static_cast<size_t>(18)); i++) {
           frame.push_back(payload[i]);
         }
-        ESP_LOGD(TAG, "Extracted A1 format frame, starting from third byte of payload");
+        ESP_LOGV(TAG, "Extracted A1 format frame, starting from third byte of payload");
       } else {
         ESP_LOGD(TAG, "A1 payload too small");
         return {};
